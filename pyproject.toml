@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "ipmi-cert"
+version = "0.1.1"
+description = ""
+authors = ["Kalle M. Aagaard <git@k-moeller.dk>"]
+readme = "README.md"
+packages = [{include = "ipmi_cert"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+lxml = "^4.9.2"
+requests = "^2.28.1"
+python-dotenv = "^0.21.0"
+
+
+[tool.poetry.group.dev.dependencies]
+black = "^22.12.0"
+isort = "^5.11.4"
+lxml-stubs = "^0.4.0"
+
+[tool.poetry.scripts]
+ipmi_update_cert = 'ipmi_cert:main'
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
