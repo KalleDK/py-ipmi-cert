@@ -332,6 +332,18 @@ def get_args():
             no_ssl_check=True,
         )
 
+    if len(sys.argv) == 2 and sys.argv[1] == "acme":
+        domain = os.environ["Le_Domain"]
+        load_dotenv(f"/etc/ipmi_cert/{domain}.env")
+        return ArgsDict(
+            ipmi_url=os.getenv("IPMI_HOST", f"https://{domain}"),
+            username=os.environ["IPMI_USER"],
+            password=os.environ["IPMI_PASS"],
+            cert_file=os.environ["CERT_FULLCHAIN_PATH"],
+            key_file=os.environ["CERT_KEY_PATH"],
+            no_ssl_check=True,
+        )
+
     parser = argparse.ArgumentParser(
         description="Update Supermicro IPMI SSL certificate"
     )
