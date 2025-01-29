@@ -48,4 +48,3 @@ test = [
     "pytest>=8.3.4",
     "pytest-coverage>=0.0",
 ]
-stubs = ["lxml-stubs>=0.4.0"]
