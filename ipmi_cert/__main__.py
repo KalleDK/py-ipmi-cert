@@ -1,4 +1,4 @@
-from ipmi_cert import main
+from ipmi_cert.cli import main
 
 if __name__ == "__main__":
     main()

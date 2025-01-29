@@ -1,465 +1,249 @@
-import argparse
-import collections.abc
+import contextlib
 import dataclasses
 import logging
-import os
+import pathlib
 import re
-import sys
-from base64 import b64encode
 from datetime import datetime
-from typing import Any, Optional, Union, cast
+from typing import Any, Generator, Literal, Mapping, overload
 
-import requests
-from dotenv import load_dotenv  # type: ignore
-from lxml import etree
+import httpx
+import pydantic
+import pydantic.fields
+
+from ipmi_cert._types import BMCResetStateCode, Credentials
+from ipmi_cert.forms import Form, OperationForm, SSLUploadForm, X11LoginForm
+from ipmi_cert.xmlparser import BaseXML
 
 log = logging.getLogger(__name__)
 
-Element = Any
+# region Responses
+
+
+class SSLStatus(BaseXML):
+    has_cert: bool = pydantic.Field(validation_alias="CERT_EXIST")
+    valid_from: datetime | None
+    valid_until: datetime | None
+
+    @pydantic.field_validator("has_cert", mode="before")
+    @classmethod
+    def _parse_has_cert(cls, value: str):
+        return int(value) > 0
+
+    @pydantic.field_validator("valid_from", "valid_until", mode="before")
+    @classmethod
+    def _parse_datetime(cls, value: str | datetime | None) -> datetime | None:
+        if isinstance(value, str):
+            return datetime.strptime(value, "%b %d %H:%M:%S %Y")
+        return value
+
+
+class SSLInfo(BaseXML):
+    status: SSLStatus | None = None
+    validated: int | None = pydantic.Field(default=None, validation_alias="VALIDATE")
+
+
+class SSLStatusResponse(BaseXML):
+    ssl_info: SSLInfo
+
+
+class BMCResetState(BaseXML):
+    code: BMCResetStateCode
+
+
+class BMCReset(BaseXML):
+    state: BMCResetState
+
+
+class BMCResetResponse(BaseXML):
+    bmc_reset: BMCReset
+
+
+# endregion
+
+# region Config
+
+DOMAIN_RE = re.compile(r"^[a-zA-Z\d-]{,63}(\.[a-zA-Z\d-]{,63})*$")
 
 
 @dataclasses.dataclass
-class SSLStatus:
-    has_cert: bool
-    valid_from: Optional[datetime]
-    valid_until: Optional[datetime]
+class Config:
+    ipmi_url: str
+    key_file: pathlib.Path
+    cert_file: pathlib.Path
+    credentials: Credentials
+    quiet: bool
+    debug: bool
+    no_reboot: bool
+    no_ssl_check: bool
+    base_url: str = dataclasses.field(init=False)
 
-    @classmethod
-    def from_xml(cls, item: Element):
-        return cls(
-            has_cert=int(item.get("CERT_EXIST", 0)) > 0,
-            valid_from=_parse_opt_datetime(item.get("VALID_FROM")),
-            valid_until=_parse_opt_datetime(item.get("VALID_UNTIL")),
-        )
-
-
-@dataclasses.dataclass(slots=True)
-class FormFile:
-    filename: str
-    data: Union[bytes, str]
-    content_type: str = "application/octet-stream"
-
-    def as_formdata(self):
-        return (self.filename, self.data, self.content_type)
+    def __post_init__(self):
+        if DOMAIN_RE.match(self.ipmi_url):
+            self.base_url = f"https://{self.ipmi_url}"
+        elif self.ipmi_url.endswith("/"):
+            self.base_url = self.ipmi_url[:-1]
+        else:
+            self.base_url = self.ipmi_url
 
 
-@dataclasses.dataclass(slots=True)
-class Form(collections.abc.Mapping[str, Any]):
-    def __iter__(self):
-        for x in ["data", "files"]:
-            yield x
+# endregion
 
-    def __len__(self) -> int:
-        return 2
-
-    def __getitem__(self, key: str):
-        if key == "files":
-            return self._get_files()
-        if key == "data":
-            return self._get_data()
-
-    def _get_files(self):
-        files: list[tuple[str, tuple[str, str | bytes, str]]] = []
-        fields = dataclasses.fields(self)
-        for field in fields:
-            value = getattr(self, field.name)
-            if isinstance(value, FormFile):
-                key = field.name
-                if field.metadata is not None and "key" in field.metadata:
-                    key = field.metadata["key"]
-                files.append((key, value.as_formdata()))
-
-        if len(files) < 1:
-            return None
-
-        return files
-
-    def _get_data(self):
-        data: dict[str, Any] = {}
-        fields = dataclasses.fields(self)
-        for field in fields:
-            value = getattr(self, field.name)
-            if not isinstance(value, FormFile):
-                key = field.name
-                if field.metadata is not None and "key" in field.metadata:
-                    key = field.metadata["key"]
-                data[key] = value
-
-        if len(data) < 1:
-            return None
-
-        return data
+# region Auth
 
 
-@dataclasses.dataclass(slots=True)
-class SSLUploadForm(Form):
-    CSRF_TOKEN: str
-    cert_file: FormFile
-    key_file: FormFile
+class IPMIAuth(httpx.Auth):
+    requires_response_body = True
 
+    def __init__(self, credentials: Credentials):
+        self._credentials = credentials
+        self._csrf_token: str | None = None
+        self._client: httpx.Client | httpx.AsyncClient | None = None
 
-@dataclasses.dataclass(slots=True)
-class X11LoginForm(Form):
-    name: bytes
-    pwd: bytes
-    check: str
+    @property
+    def csrf_token(self) -> str:
+        if self._csrf_token is None:
+            raise Exception("csrf token not set")
+        return self._csrf_token
 
+    @property
+    def client(self) -> httpx.Client | httpx.AsyncClient:
+        if self._client is None:
+            raise Exception("client not set")
+        return self._client
 
-@dataclasses.dataclass(slots=True)
-class OperationForm(Form):
-    op: str
-    r: Optional[str] = None
-    underscore: str = dataclasses.field(default="", metadata={"key": "_"})
+    @client.setter
+    def client(self, value: httpx.Client | httpx.AsyncClient):
+        self._client = value
 
-
-def _parse_opt_datetime(line: Optional[str]):
-    if line is None:
-        return None
-    return datetime.strptime(line, "%b %d %H:%M:%S %Y")
-
-
-def _clean_cert_data(data: bytes):
-    return (
-        b"\n".join(
-            re.findall(
-                b"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
-                data,
-                re.DOTALL,
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        if self._csrf_token is None:
+            response = yield self.client.build_request(
+                "POST", "cgi/login.cgi", data=X11LoginForm.create(self._credentials).data
             )
-        )
-        + b"\n"
-    )
+            response.raise_for_status()
 
+            response = yield self.client.build_request("GET", "/cgi/url_redirect.cgi?url_name=topmenu")
+            response.raise_for_status()
 
-@dataclasses.dataclass(slots=True)
-class IPMICertUpdater:
-    session: requests.Session
-    url: str
-    verify: Optional[bool] = None
-    timeout: Optional[float] = None
-    csfr_token: str = ""
+            self._csrf_token = self._get_csrf_token(response)
 
-    def _make_redirect_url(self, url_name: str):
-        return f"{self.url}/cgi/url_redirect.cgi?url_name={url_name}"
+        self.client.cookies.set_cookie_header(request)
 
-    def _post(self, url: str, headers: dict[str, Any], form: Form):
-        result = self.session.post(
-            url,
-            **form,
-            headers=headers,
-            timeout=self.timeout,
-            verify=self.verify,
-        )
+        if request.url.path.endswith("/cgi/ipmi.cgi"):
+            request.headers["CSRF_TOKEN"] = self._csrf_token
+            request.headers["X-Requested-With"] = "XMLHttpRequest"
+            yield request
 
-        result.raise_for_status()
+        elif request.url.path.endswith("/cgi/op.cgi"):
+            request.headers["CSRF_TOKEN"] = self._csrf_token
+            request.headers["X-Requested-With"] = "XMLHttpRequest"
+            yield request
 
-        return result.text
+        else:
+            response = yield request
+            self._csrf_token = self._get_csrf_token(response)
 
-    def _get(self, url: str, headers: Optional[dict[str, Any]] = None):
-        result = self.session.get(
-            url,
-            headers=headers,
-            timeout=self.timeout,
-            verify=self.verify,
-        )
-
-        result.raise_for_status()
-
-        return result.text
-
-    # region Forms
-
-    def _make_login_form(self, username: str, password: str):
-        return X11LoginForm(
-            name=b64encode(username.encode("UTF-8")),
-            pwd=b64encode(password.encode("UTF-8")),
-            check="00",
-        )
-
-    def _make_ssl_cert_form(self, cert_data: bytes, key_data: bytes):
-        return SSLUploadForm(
-            CSRF_TOKEN=self.csfr_token,
-            cert_file=FormFile("server_cert.pem", cert_data),
-            key_file=FormFile("server_key.pem", key_data),
-        )
-
-    # endregion
-
-    def _get_csrf_token(self, url_name: str):
-        body = self._get(url=self._make_redirect_url(url_name))
-
-        match = re.search(r'SmcCsrfInsert\s*\("CSRF_TOKEN"\s*,\s*"([^"]+)"\);', body)
+    def _get_csrf_token(self, resp: httpx.Response) -> str:
+        match = re.search(r'SmcCsrfInsert\s*\("CSRF_TOKEN"\s*,\s*"([^"]+)"\);', resp.text)
         if not match:
             raise Exception("can't find csrf token")
 
-        return cast(str, match.group(1))
+        return match.group(1)
 
-    def _make_headers(self, url_name: str):
-        return {
-            "Origin": self.url,
-            "Referer": self._make_redirect_url(url_name),
-        }
 
-    def _make_xhr_headers(self, url_name: str):
-        headers = self._make_headers(url_name)
-        headers["CSRF_TOKEN"] = self.csfr_token
-        headers["X-Requested-With"] = "XMLHttpRequest"
-        return headers
+# endregion
 
-    def _do_op(self, form: OperationForm):
-        body = self._post(
-            f"{self.url}/cgi/op.cgi",
-            headers=self._make_xhr_headers("mainmenu"),
-            form=form,
+
+@dataclasses.dataclass(slots=True)
+class IPMIApi:
+    transport: httpx.AsyncClient
+    auth: IPMIAuth
+
+    @classmethod
+    @contextlib.asynccontextmanager
+    async def session(cls, config: Config):
+        auth = IPMIAuth(config.credentials)
+        client = httpx.AsyncClient(base_url=config.base_url, auth=auth, verify=(not config.no_ssl_check))
+        auth.client = client
+        api = IPMIApi(
+            client,
+            auth,
         )
+        try:
+            yield api
+        finally:
+            pass
 
-        return etree.fromstring(body)
+    async def _get(self, url: str, headers: Mapping[str, Any] | None = None):
+        result = (await self.transport.get(url, headers=headers)).raise_for_status()
 
-    def _do_ipmi_op(self, form: OperationForm):
-        body = self._post(
-            f"{self.url}/cgi/ipmi.cgi",
-            headers=self._make_xhr_headers("mainmenu"),
-            form=form,
-        )
+        return result.text
 
-        log.debug(body)
+    async def _post(self, url: str, *, headers: Mapping[str, Any] | None = None, form: Form | None = None):
+        result = (
+            await self.transport.post(
+                url,
+                data=None if form is None else form.data,
+                files=None if form is None else form.files,
+                headers=headers,
+            )
+        ).raise_for_status()
 
-        return etree.fromstring(body)
+        return result.text
 
-    def login(self, username: str, password: str):
-        """
-        Log into IPMI interface
-        :param username: username to use for logging in
-        :param password: password to use for logging in
-        :return: bool
-        """
-        self._post(
-            f"{self.url}/cgi/login.cgi",
-            headers={},
-            form=self._make_login_form(username, password),
-        )
+    async def _do_op[T: BaseXML](self, cls: type[T], form: OperationForm) -> T:
+        resp = await self._post("/cgi/op.cgi", form=form)
+        return cls.model_validate_xml(resp)
 
-        self.csfr_token = self._get_csrf_token("topmenu")
+    async def _do_ipmi_op[T: BaseXML](self, cls: type[T], form: OperationForm) -> T:
+        log.debug("doing ipmi op %s", form.op)
+        resp = await self._post("/cgi/ipmi.cgi", form=form)
+        log.debug("got response %s", resp)
+        return cls.model_validate_xml(resp)
 
-        return True
+    async def get_cert_status(self) -> SSLStatus:
+        resp = await self._do_ipmi_op(SSLStatusResponse, OperationForm("SSL_STATUS.XML", "(0,0)"))
 
-    def get_cert_valid(self):
-        """
-        Verify existing certificate information
-        :return: bool
-        """
-        root = self._do_ipmi_op(OperationForm("SSL_VALIDATE.XML", "(0,0)"))
-
-        # <?xml> <IPMI> <SSL_INFO>
-        status = root.find("SSL_INFO")
-        if status is None:
-            return False
-
-        return int(status.get("VALIDATE", 0)) == 1
-
-    def get_cert_status(self):
-        """
-        Verify existing certificate information
-        :return: dict
-        """
-
-        root = self._do_ipmi_op(OperationForm("SSL_STATUS.XML", "(0,0)"))
-
-        # <?xml> <IPMI> <SSL_INFO> <STATUS>
-        status = root.find("SSL_INFO/STATUS")
-        if status is None:
+        if resp.ssl_info.status is None:
             raise Exception("cant find ssl status")
 
-        return SSLStatus.from_xml(status)
+        return resp.ssl_info.status
 
-    def reboot(self):
-        root = self._do_op(OperationForm("main_bmcreset"))
-        status = root.find("BMC_RESET/STATE")
-        if status is None:
-            raise Exception("cant find reset status")
+    async def validate_uploaded_cert(self):
+        resp = await self._do_ipmi_op(SSLStatusResponse, OperationForm("SSL_VALIDATE.XML", "(0,0)"))
+        if resp.ssl_info.validated is None:
+            raise Exception("cant find ssl validation")
 
-        log.debug(status.get("CODE"))
+        return resp.ssl_info.validated == 1
 
-        return status.get("CODE", "").upper() == "OK"
+    @overload
+    async def upload_cert(
+        self, cert: bytes | pathlib.Path, key: bytes | pathlib.Path, validate: Literal[True] = ...
+    ) -> bool: ...
 
-    def upload_cert(self, key: bytes, cert: bytes):
-        """
-        Send X.509 certificate and private key to server
-        :param session: Current session object
-        :type session requests.session
-        :param url: base-URL to IPMI
-        :param key_file: filename to X.509 certificate private key
-        :param cert_file: filename to X.509 certificate PEM
-        :return:
-        """
+    @overload
+    async def upload_cert(
+        self, cert: bytes | pathlib.Path, key: bytes | pathlib.Path, validate: Literal[False]
+    ) -> None: ...
 
-        # extract certificates only (IPMI doesn't like DH PARAMS)
-        cert = _clean_cert_data(cert)
+    @overload
+    async def upload_cert(
+        self, cert: bytes | pathlib.Path, key: bytes | pathlib.Path, validate: bool
+    ) -> bool | None: ...
 
-        self._post(
-            f"{self.url}/cgi/upload_ssl.cgi",
-            form=self._make_ssl_cert_form(cert, key),
-            headers=self._make_headers("config_ssl"),
-        )
+    async def upload_cert(
+        self, cert: bytes | pathlib.Path, key: bytes | pathlib.Path, validate: bool = True
+    ) -> bool | None:
+        if isinstance(cert, pathlib.Path):
+            cert = cert.read_bytes()
+        if isinstance(key, pathlib.Path):
+            key = key.read_bytes()
+        await self._post("/cgi/upload_ssl.cgi", form=SSLUploadForm.from_bytes(self.auth.csrf_token, cert, key))
 
-        return self.get_cert_valid()
+        if validate:
+            return await self.validate_uploaded_cert()
 
+    async def reboot(self):
+        resp = await self._do_op(BMCResetResponse, OperationForm("main_bmcreset"))
 
-@dataclasses.dataclass
-class ArgsDict:
-    ipmi_url: str
-    key_file: str
-    cert_file: str
-    username: str
-    password: str
-    quiet: bool = False
-    debug: bool = False
-    no_reboot: bool = False
-    no_ssl_check: bool = False
-
-
-def get_args():
-
-    if len(sys.argv) == 2 and sys.argv[1] == "lego":
-        domain = os.environ["LEGO_CERT_DOMAIN"]
-        load_dotenv(f"/etc/ipmi_cert/{domain}.env")
-        return ArgsDict(
-            ipmi_url=os.getenv("IPMI_HOST", f"https://{domain}"),
-            username=os.environ["IPMI_USER"],
-            password=os.environ["IPMI_PASS"],
-            cert_file=os.environ["LEGO_CERT_PATH"],
-            key_file=os.environ["LEGO_CERT_KEY_PATH"],
-            no_ssl_check=True,
-        )
-
-    if len(sys.argv) == 2 and sys.argv[1] == "acme":
-        domain = os.environ["Le_Domain"]
-        load_dotenv(f"/etc/ipmi_cert/{domain}.env")
-        return ArgsDict(
-            ipmi_url=os.getenv("IPMI_HOST", f"https://{domain}"),
-            username=os.environ["IPMI_USER"],
-            password=os.environ["IPMI_PASS"],
-            cert_file=os.environ["CERT_FULLCHAIN_PATH"],
-            key_file=os.environ["CERT_KEY_PATH"],
-            no_ssl_check=True,
-        )
-
-    parser = argparse.ArgumentParser(
-        description="Update Supermicro IPMI SSL certificate"
-    )
-    parser.add_argument(
-        "-i", "--ipmi-url", required=True, help="Supermicro IPMI 2.0 URL"
-    )
-    parser.add_argument(
-        "-k", "--key-file", required=True, help="X.509 Private key filename"
-    )
-    parser.add_argument(
-        "-c", "--cert-file", required=True, help="X.509 Certificate filename"
-    )
-    parser.add_argument(
-        "-u", "--username", required=True, help="IPMI username with admin access"
-    )
-    parser.add_argument("-p", "--password", required=True, help="IPMI user password")
-    parser.add_argument(
-        "--no-reboot",
-        action="store_true",
-        help="The default is to reboot the IPMI after upload for the change to take effect.",
-    )
-    parser.add_argument(
-        "-q",
-        "--quiet",
-        action="store_true",
-        help="Do not output anything if successful",
-    )
-    parser.add_argument(
-        "-d",
-        "--debug",
-        action="store_true",
-        help="Enable debug",
-    )
-    parser.add_argument(
-        "--no-ssl-check",
-        action="store_true",
-        help="Ignore ssl cert",
-    )
-    args: ArgsDict = cast(ArgsDict, parser.parse_args())
-    return args
-
-
-def main():
-    args = get_args()
-
-    # Confirm args
-    if not os.path.isfile(args.key_file):
-        print(f"--key-file '{args.key_file}' doesn't exist!")
-        exit(2)
-    if not os.path.isfile(args.cert_file):
-        print(f"--cert-file '{args.cert_file}' doesn't exist!")
-        exit(2)
-    if args.ipmi_url[-1] == "/":
-        args.ipmi_url = args.ipmi_url[0:-1]
-
-    if not args.quiet:
-        level = logging.INFO
-        if args.debug:
-            level = logging.DEBUG
-        logging.basicConfig(level=level)
-        # requests_log = logging.getLogger("requests.packages.urllib3")
-        # requests_log.setLevel(logging.INFO)
-
-    # Start the operation
-    if args.no_ssl_check:
-        InsecureRequestWarning = requests.packages.urllib3.exceptions.InsecureRequestWarning  # type: ignore
-        requests.packages.urllib3.disable_warnings(InsecureRequestWarning)  # type: ignore
-
-    updater = IPMICertUpdater(
-        session=requests.session(), url=args.ipmi_url, verify=(not args.no_ssl_check)
-    )
-
-    if not updater.login(args.username, args.password):
-        print("Login failed. Cannot continue!")
-        exit(2)
-
-    cert_info = updater.get_cert_status()
-    if not cert_info:
-        print("Failed to extract certificate information from IPMI!")
-        exit(2)
-    if not args.quiet and cert_info.has_cert:
-        print(
-            f"There exists a certificate, which is valid until: {cert_info.valid_until}"
-        )
-
-    # Go upload!
-    with open(args.cert_file, "rb") as fp:
-        cert = fp.read()
-    with open(args.key_file, "rb") as fp:
-        key = fp.read()
-    if not updater.upload_cert(key, cert):
-        print("Failed to upload X.509 files to IPMI!")
-        exit(2)
-
-    if not args.quiet:
-        print("Uploaded files ok.")
-
-    cert_info = updater.get_cert_status()
-    if not cert_info:
-        print("Failed to extract certificate information from IPMI!")
-        exit(2)
-
-    if not args.quiet and cert_info.has_cert:
-        print(
-            f"After upload, there exists a certificate, which is valid until: {cert_info.valid_until}"
-        )
-
-    if not args.no_reboot:
-        if not args.quiet:
-            print("Rebooting IPMI to apply changes.")
-        if not updater.reboot():
-            print("Rebooting failed! Go reboot it manually?")
-
-    if not args.quiet:
-        print("All done!")
-
-
-if __name__ == "__main__":
-    main()
+        return resp.bmc_reset.state.code == BMCResetStateCode.OK

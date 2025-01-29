@@ -1,26 +1,52 @@
-[tool.poetry]
+#:schema https://json.schemastore.org/pyproject.json
+
+[project]
 name = "ipmi-cert"
 version = "0.1.1"
 description = ""
-authors = ["Kalle M. Aagaard <git@k-moeller.dk>"]
+authors = [{ name = "Kalle M. Aagaard", email = "git@k-moeller.dk" }]
 readme = "README.md"
-packages = [{include = "ipmi_cert"}]
+requires-python = ">=3.13"
+license = "MIT" 
+license-files = ["LICENSE"]
 
-[tool.poetry.dependencies]
-python = "^3.10"
-lxml = "^4.9.2"
-requests = "^2.28.1"
-python-dotenv = "^0.21.0"
+dependencies = [
+    "lxml>=4.9.2",
+    "python-dotenv>=0.21.0",
+    "typer>=0.15.1",
+    "httpx>=0.28.1",
+    "secretstr>=0.1.0",
+    "pydantic>=2.10.6",
+]
 
 
-[tool.poetry.group.dev.dependencies]
-black = "^22.12.0"
-isort = "^5.11.4"
-lxml-stubs = "^0.4.0"
+[project.scripts]
+ipmi-update-cert = 'ipmi_cert:cli.main'
 
-[tool.poetry.scripts]
-ipmi_update_cert = 'ipmi_cert:main'
+[project.urls]
+Repository = "https://github.com/KalleDK/py-ipmi-cert"
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.pyright]
+include = ["src", "tests"]
+
+[tool.pytest.ini_options]
+addopts = "-v --cov=ipmi_cert --cov-report=xml --cov-report=term"
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+tools = [
+    "pyright>=1.1.392.post0",
+    "ruff>=0.9.3",
+]
+test = [
+    "pytest>=8.3.4",
+    "pytest-coverage>=0.0",
+]
+stubs = ["lxml-stubs>=0.4.0"]
