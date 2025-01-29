@@ -138,7 +138,7 @@ wheels = [
 
 [[package]]
 name = "ipmi-cert"
-version = "0.1.2"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -168,7 +168,6 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-stubs = []
 test = [
     { name = "pytest", specifier = ">=8.3.4" },
     { name = "pytest-coverage", specifier = ">=0.0" },

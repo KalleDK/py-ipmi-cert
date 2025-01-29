@@ -2,7 +2,7 @@
 
 [project]
 name = "ipmi-cert"
-version = "0.1.2"
+version = "1.0.0"
 description = ""
 authors = [{ name = "Kalle M. Aagaard", email = "git@k-moeller.dk" }]
 readme = "README.md"
