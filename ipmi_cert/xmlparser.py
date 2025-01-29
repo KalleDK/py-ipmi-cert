@@ -1,16 +1,10 @@
 import typing
 import xml.etree.ElementTree as ET
 from types import NoneType, UnionType
-from typing import TYPE_CHECKING, Any, Mapping, Self
+from typing import Any, Mapping, Self
 
 import pydantic
 import pydantic.fields
-
-if TYPE_CHECKING:
-    from lxml.etree import _Element as Element
-else:
-    Element = object
-
 
 # region XML parsing
 

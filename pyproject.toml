@@ -2,7 +2,7 @@
 
 [project]
 name = "ipmi-cert"
-version = "0.1.1"
+version = "0.1.2"
 description = ""
 authors = [{ name = "Kalle M. Aagaard", email = "git@k-moeller.dk" }]
 readme = "README.md"
@@ -11,7 +11,6 @@ license = "MIT"
 license-files = ["LICENSE"]
 
 dependencies = [
-    "lxml>=4.9.2",
     "python-dotenv>=0.21.0",
     "typer>=0.15.1",
     "httpx>=0.28.1",
