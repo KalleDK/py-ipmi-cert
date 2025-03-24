@@ -40,7 +40,7 @@ def _is_list_type(field: Any) -> bool:
     origin = typing.get_origin(field)
     if origin is UnionType:
         args = typing.get_args(field)
-        args = [arg for arg in args if arg is not NoneType]
+        args = tuple(arg for arg in args if arg is not NoneType)
         return any(_is_list_type(arg) for arg in args)
 
     return origin is list
@@ -68,7 +68,7 @@ def to_pyd_dict(
             result[name] = value.attrib[name]
         elif allow_field_name and name in lower_attribs:
             result[name] = lower_attribs[name]
-        elif field.validation_alias in value.attrib:
+        elif field.validation_alias in value.attrib and isinstance(field.validation_alias, str):
             result[field.validation_alias] = value.attrib[field.validation_alias]
         elif field.alias in value.attrib:
             result[field.alias] = value.attrib[field.alias]
@@ -76,7 +76,7 @@ def to_pyd_dict(
             result[name] = to_one(value.children[name], is_list)
         elif allow_field_name and name in lower_children:
             result[name] = to_one(lower_children[name], is_list)
-        elif field.validation_alias in value.children:
+        elif field.validation_alias in value.children and isinstance(field.validation_alias, str):
             result[field.validation_alias] = to_one(value.children[field.validation_alias], is_list)
         elif field.alias in value.children:
             result[field.alias] = to_one(value.children[field.alias], is_list)
